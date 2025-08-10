@@ -377,54 +377,54 @@ __global__ void hello_from_gpu() {
 
 
 
-__device__ __forceinline__ bfloat16 fp8_to_fp16(uint8_t fp8_val) {
-    // E4M3 FP8 format to FP16 (half precision)
-    int sign = (fp8_val & 0x80) ? -1 : 1;
-    int exp  = (fp8_val & 0x78) >> 3;
-    int mant = (fp8_val & 0x07);
+// __device__ __forceinline__ bfloat16 fp8_to_fp16(uint8_t fp8_val) {
+//     // E4M3 FP8 format to FP16 (half precision)
+//     int sign = (fp8_val & 0x80) ? -1 : 1;
+//     int exp  = (fp8_val & 0x78) >> 3;
+//     int mant = (fp8_val & 0x07);
 
-    if (exp == 0) {
-        float val = sign * mant * powf(2, -6);  // subnormal
-        return bfloat16(val);
-    } else if (exp == 0xF) {
-        return bfloat16(sign * INFINITY);   // Inf/NaN
-    } else {
-        float val = sign * (1.0f + mant / 8.0f) * powf(2, exp - 7);
-        return bfloat16(val);
-    }
-}
+//     if (exp == 0) {
+//         float val = sign * mant * powf(2, -6);  // subnormal
+//         return bfloat16(val);
+//     } else if (exp == 0xF) {
+//         return bfloat16(sign * INFINITY);   // Inf/NaN
+//     } else {
+//         float val = sign * (1.0f + mant / 8.0f) * powf(2, exp - 7);
+//         return bfloat16(val);
+//     }
+// }
 
-__global__ void convert_fp8_to_fp16_kernel(
-    const uint8_t* __restrict__ src_fp8,
-    bfloat16* __restrict__ dst_fp16,
-    int rows, int cols, int stride_fp8, int stride_fp16) 
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+// __global__ void convert_fp8_to_fp16_kernel(
+//     const uint8_t* __restrict__ src_fp8,
+//     bfloat16* __restrict__ dst_fp16,
+//     int rows, int cols, int stride_fp8, int stride_fp16) 
+// {
+//     int row = blockIdx.y * blockDim.y + threadIdx.y;
+//     int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (row < rows && col < cols) {
-        // Calculate source and destination index considering stride
-        int src_idx = row  + col * stride_fp8;
-        int dst_idx = row  + col * stride_fp16;
+//     if (row < rows && col < cols) {
+//         // Calculate source and destination index considering stride
+//         int src_idx = row  + col * stride_fp8;
+//         int dst_idx = row  + col * stride_fp16;
 
-        dst_fp16[dst_idx] = fp8_to_fp16(src_fp8[src_idx]);
-    }
-}
+//         dst_fp16[dst_idx] = fp8_to_fp16(src_fp8[src_idx]);
+//     }
+// }
 
 
-void convert_fp8_to_fp16(const uint8_t* weight_fp8,
-                         bfloat16* weight_fp16,
-                         int rows, int cols,
-                         int stride_fp8, int stride_fp16) 
-{
-    dim3 block(16, 16);
-    dim3 grid((cols + block.x - 1) / block.x,
-              (rows + block.y - 1) / block.y);
+// void convert_fp8_to_fp16(const uint8_t* weight_fp8,
+//                          bfloat16* weight_fp16,
+//                          int rows, int cols,
+//                          int stride_fp8, int stride_fp16) 
+// {
+//     dim3 block(16, 16);
+//     dim3 grid((cols + block.x - 1) / block.x,
+//               (rows + block.y - 1) / block.y);
 
-    convert_fp8_to_fp16_kernel<<<grid, block>>>(
-        weight_fp8, weight_fp16, rows, cols, stride_fp8, stride_fp16);
-    cudaDeviceSynchronize();
-}
+//     convert_fp8_to_fp16_kernel<<<grid, block>>>(
+//         weight_fp8, weight_fp16, rows, cols, stride_fp8, stride_fp16);
+//     cudaDeviceSynchronize();
+// }
 
 
 // load 128 bytes values from global to shared memory async
@@ -455,33 +455,73 @@ __device__ __forceinline__ void assert_aligned(const void* ptr, size_t alignment
 //     return __float2half(f) * scale;
 // }
 
-__device__ __forceinline__ float fp8_to_float(uint8_t val, bool e5m2 = false) {
-    // Sign extraction
-    int sign = (val & 0x80) ? -1 : 1; // MSB is sign bit
-    int exponent, mantissa;
+// __device__ __forceinline__ float fp8_to_float(uint8_t val, bool e5m2 = false) {
+//     // Sign extraction
+//     int sign = (val & 0x80) ? -1 : 1; // MSB is sign bit
+//     int exponent, mantissa;
+
+//     if (e5m2) {
+//         // FP8 E5M2: 1 sign, 5 exponent, 2 mantissa
+//         exponent = (val >> 2) & 0x1F;   // bits 2-6
+//         mantissa = val & 0x03;          // bits 0-1
+//         if (exponent == 0) {
+//             // Subnormal
+//             return sign * ldexpf((float)mantissa, -2 - 14); 
+//         } else if (exponent == 0x1F) {
+//             return sign * (mantissa ? NAN : INFINITY); 
+//         }
+//         return sign * (1.0f + mantissa / 4.0f) * ldexpf(1.0f, exponent - 15);
+//     } 
+//     else {
+//         // FP8 E4M3: 1 sign, 4 exponent, 3 mantissa
+//         exponent = (val >> 3) & 0x0F;   // bits 3-6
+//         mantissa = val & 0x07;          // bits 0-2
+//         if (exponent == 0) {
+//             return sign * ldexpf((float)mantissa, -3 - 6); 
+//         } else if (exponent == 0x0F) {
+//             return sign * (mantissa ? NAN : INFINITY);
+//         }
+//         return sign * (1.0f + mantissa / 8.0f) * ldexpf(1.0f, exponent - 7);
+//     }
+// }
+
+// ---------- FP8 -> FP32 ----------
+__device__ __forceinline__ float fp8_to_float(uint8_t v, bool e5m2 = false) {
+    int sign = (v & 0x80) ? -1 : 1;
 
     if (e5m2) {
-        // FP8 E5M2: 1 sign, 5 exponent, 2 mantissa
-        exponent = (val >> 2) & 0x1F;   // bits 2-6
-        mantissa = val & 0x03;          // bits 0-1
+        // E5M2：保持你原实现
+        int exponent = (v >> 2) & 0x1F;
+        int mantissa = v & 0x03;
         if (exponent == 0) {
-            // Subnormal
-            return sign * ldexpf((float)mantissa, -2 - 14); 
+            // subnormal
+            return sign * ldexpf((float)mantissa, -2 - 14);
         } else if (exponent == 0x1F) {
-            return sign * (mantissa ? NAN : INFINITY); 
-        }
-        return sign * (1.0f + mantissa / 4.0f) * ldexpf(1.0f, exponent - 15);
-    } 
-    else {
-        // FP8 E4M3: 1 sign, 4 exponent, 3 mantissa
-        exponent = (val >> 3) & 0x0F;   // bits 3-6
-        mantissa = val & 0x07;          // bits 0-2
-        if (exponent == 0) {
-            return sign * ldexpf((float)mantissa, -3 - 6); 
-        } else if (exponent == 0x0F) {
+            // E5M2 有 Inf/NaN
             return sign * (mantissa ? NAN : INFINITY);
         }
-        return sign * (1.0f + mantissa / 8.0f) * ldexpf(1.0f, exponent - 7);
+        return sign * (1.0f + mantissa / 4.0f) * ldexpf(1.0f, exponent - 15);
+    } else {
+        // E4M3（新定义）
+        int exponent = (v >> 3) & 0x0F; // 4-bit exponent
+        int mantissa = v & 0x07;        // 3-bit mantissa
+
+        if (exponent == 0) {
+            // 次正规：mant * 2^-9
+            if (mantissa == 0) return sign * 0.0f;
+            return sign * ldexpf((float)mantissa, -9);
+        } else if (exponent == 0x0F) {
+            // exp=1111：仍可为规格化；唯独 mant=111 是 NaN（无 Inf）
+            if (mantissa == 0x7) {
+                return NAN;
+            } else {
+                // 规范化，指数当作 15 使用
+                return sign * (1.0f + mantissa / 8.0f) * ldexpf(1.0f, 15 - 7);
+            }
+        } else {
+            // 普通规范化
+            return sign * (1.0f + mantissa / 8.0f) * ldexpf(1.0f, exponent - 7);
+        }
     }
 }
 
@@ -578,7 +618,26 @@ __device__ __forceinline__ void load_smem_raw2(FP8 *smem_ptr, FP8 const *gmem_pt
 #endif
 }
 
+// Ceil-div as constexpr
+constexpr int ceil_div_constexpr(int a, int b) {
+  return (a + b - 1) / b;
+}
 
+template <typename T, int WB_K, int WB_N, int REDUCTION_SIZE, int OUTPUT_SIZE>
+__device__ __forceinline__ T load_weight_scale(
+    T const* __restrict__ scale_base,
+    int k_row_global,
+    int n_col_global)
+{
+  // derive block counts at compile time
+  constexpr int K_BLOCKS = (REDUCTION_SIZE + WB_K - 1) / WB_K;
+  // constexpr int N_BLOCKS = (OUTPUT_SIZE    + WB_N - 1) / WB_N; // not needed here
+
+  int kb = k_row_global / WB_K;
+  int nb = n_col_global / WB_N;
+  int idx = kb + nb * K_BLOCKS;      // column-major
+  return scale_base[idx];
+}
 
 // Define FP8 type (choose format as needed)
 // using fp8_t = type::fp8_e4m3_t;  // or type::fp8_e5m2_t
@@ -599,6 +658,18 @@ __device__ __forceinline__ void linear_kernel_fp8_weight(
     void *output_ptr,                  // fp16 output
     // void const *weight_scale_ptr = nullptr,      // fp16 scale (per group)
     bool residual = true) {
+      
+      // Add near the top of the function (constants + helpers)
+      constexpr int WB_K = 128;  // weight_block_size along K
+      constexpr int WB_N = 128;  // weight_block_size along N
+
+      // Number of scale blocks
+      constexpr int K_BLOCKS = ceil_div_constexpr(REDUCTION_SIZE, WB_K);
+      constexpr int N_BLOCKS = ceil_div_constexpr(OUTPUT_SIZE,    WB_N);
+
+
+
+
       // Global memory pointer alignment checks
   assert_aligned(input_ptr, alignof(T), "input_ptr");
   assert_aligned(weight_fp8_ptr, alignof(FP8), "weight_fp8_ptr");
@@ -868,8 +939,17 @@ __device__ __forceinline__ void linear_kernel_fp8_weight(
         T scale =static_cast<T>(1.0f); // For simplicity, assume scale is 1.0f
         // Convert FP8 → FP16 in shared memory
 
+        // Base N of this output-atom tile
+        int base_n_col = output_atom_idx * OUTPUT_ATOM_SIZE;
+
+
         #pragma unroll
         for (int k = 0; k < CHUNK_SIZE_W; k++) {
+
+          int k_row_global = src_row + k;                // along K
+          int n_col_global = base_n_col + src_col;       // along N
+          T scale = load_weight_scale<T, WB_K, WB_N, REDUCTION_SIZE, OUTPUT_SIZE>(d_weight_scale, k_row_global, n_col_global);
+
             assert((reinterpret_cast<uintptr_t>(weight_buffer_smem(dst_row + k, dst_col)) % alignof(T) == 0) &&
             "weight_buffer_smem not aligned");
             // assert((reinterpret_cast<uintptr_t>(weight_buffer_smem(dst_row + k, dst_col)) % 16 == 0) &&
@@ -962,9 +1042,16 @@ __device__ __forceinline__ void linear_kernel_fp8_weight(
           // T scale = weight_scale_dmem(group_idx, src_col);
           T scale = static_cast<T>(1.0f); // For simplicity, assume scale is 1.0f
 
+          // Base N of this output-atom tile
+          int base_n_col = output_atom_idx * OUTPUT_ATOM_SIZE;
+
           // Convert FP8 → FP16 in shared memory
           #pragma unroll
           for (int k = 0; k < CHUNK_SIZE_W; k++) {
+            int k_row_global = src_row + k;
+            int n_col_global = base_n_col + col;
+            T scale = load_weight_scale<T, WB_K, WB_N, REDUCTION_SIZE, OUTPUT_SIZE>(d_weight_scale, k_row_global, n_col_global);
+
               T fp16_val = static_cast<T>(fp8_to_float(fp8_val[k])) * scale; // unquantize
 
             //   T* smem_ptr = weight_buffer_smem(dst_row + k, dst_col);
