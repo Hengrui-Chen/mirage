@@ -71,6 +71,16 @@ __device__ __forceinline__ void ldsm(T *__restrict__ smem_ptr, uint32_t *R) {
       : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
       : "r"(smem_int_ptr));
 }
+// ldmatrix
+template <typename T>
+__device__ __forceinline__ void ldsm_b8(T *__restrict__ smem_ptr, uint32_t *R) {
+  uint32_t smem_int_ptr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
+      : "r"(smem_int_ptr));
+}
 template <typename T>
 __device__ __forceinline__ void ldsm_t(T *__restrict__ smem_ptr, uint32_t *R) {
   uint32_t smem_int_ptr =

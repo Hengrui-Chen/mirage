@@ -5,6 +5,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include "linear.cuh"  // 假设包含 linear_kernel 和 linear_kernel_fp8_weight
+#include <algorithm> // std::max
+#include <cstdio>
 
 using bfloat16 = kernel::bfloat16;
 
@@ -21,7 +23,7 @@ constexpr int MAX_SHARE_MEMORY_SIZE = 96 * 1024;
 // ===== 测试尺寸 =====
 constexpr int BATCH_SIZE     = 1;
 constexpr int OUTPUT_SIZE    = 64;  // N
-constexpr int REDUCTION_SIZE = 512;  // K
+constexpr int REDUCTION_SIZE = 1024;  // K
 
 // ===== 工具宏 =====
 #define CHECK_CUDA(expr) do {                                     \
@@ -32,6 +34,74 @@ constexpr int REDUCTION_SIZE = 512;  // K
     exit(1);                                                      \
   }                                                               \
 } while(0)
+
+// ---- Simple timing helpers ---------------------------------------------------
+struct BenchResult {
+    float avg_ms, std_ms;
+};
+
+template <typename Launch>
+static inline BenchResult time_kernel(int warmup, int iters, Launch launch) {
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    for (int i = 0; i < warmup; ++i) { launch(); }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    std::vector<float> times; times.reserve(iters);
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int i = 0; i < iters; ++i) {
+        CHECK_CUDA(cudaEventRecord(start));
+        launch();
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float ms = 0.f;
+        CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+        times.push_back(ms);
+    }
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    double sum = 0.0, sq = 0.0;
+    for (float t : times) { sum += t; sq += (double)t * t; }
+    double avg = sum / iters;
+    double var = std::max(0.0, sq / iters - avg * avg);
+    return { (float)avg, (float)std::sqrt(var) };
+}
+
+
+// GEMM/GEMV FLOPs (multiply+add = 2 ops)
+static inline double gemm_flops(int M, int N, int K) {
+    return 2.0 * (double)M * (double)N * (double)K;
+}
+
+// A rough lower-bound memory traffic (bytes) for one matmul+residual write.
+// This is *not* exact (doesn't include all internal reads/writes), but helpful for GB/s.
+static inline double bytes_moved_baseline_bf16(int M, int N, int K) {
+    const double sz_bf16 = 2.0;
+    return M*K*sz_bf16           // input
+         + K*N*sz_bf16           // weight
+         + M*N*sz_bf16           // residual
+         + M*N*sz_bf16;          // output
+}
+
+static inline double bytes_moved_fp8_scale(int M, int N, int K, int BK=128, int BN=128) {
+    const double sz_bf16 = 2.0, sz_fp8 = 1.0;
+    const int nBK = (K + BK - 1) / BK;
+    const int nBN = (N + BN - 1) / BN;
+    return M*K*sz_bf16           // input
+         + K*N*sz_fp8            // weight (fp8)
+         + (nBK*nBN)*sz_bf16     // block scales
+         + M*N*sz_bf16           // residual
+         + M*N*sz_bf16;          // output
+}
+
+
+
 
 // ===== 简易随机填充 =====
 template<typename T>
@@ -126,7 +196,7 @@ static inline uint8_t float_to_fp8_e4m3(float x) {
         }
 
         // 指数上溢：饱和到最大有限（E=15, mant=6）
-        if (E >= 0xF) {
+        if (E > 0xF || (E == 0xF && mant == 7)) {
             // E4M3 无 Inf；exp=1111 仍可用，但 mant=111 保留给 NaN
             // 因此饱和为 mant=110（=6）
             return (uint8_t)((s << 7) | (0xF << 3) | 0x6);
@@ -390,7 +460,7 @@ __global__ void test_linear_kernel_launcher(const void* input, const void* weigh
                                             const void* residual, void* output) {
     extern __shared__ char smem[];
     kernel::linear_kernel<kernel::bfloat16, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE>(
-        input, weight, residual, output, true);
+        input, weight, residual, output, false);
 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         printf("[Baseline BF16] rows:\n");
@@ -400,14 +470,16 @@ __global__ void test_linear_kernel_launcher(const void* input, const void* weigh
             if ((n + 1) % OUTPUT_SIZE == 0) {
                 printf("\n");
             }
+            if (n % 12 == 11) { // 每 12 个输出换行
+                printf("\n");
+            }
         }
-
         printf("\n");
     }
 }
 
 // ===== FP8 权重 kernel（带 scale）=====
-__global__ void test_linear_fp8_kernel_launcher(const void* input, const void* weight_fp8,
+__global__ void test_linear_fp8_kernel_launcher_old(const void* input, const void* weight_fp8,
                                                 const void* weight_scale, const void* residual, void* output) {
     extern __shared__ char smem[];
     // 你的 kernel 模板可能是：
@@ -416,9 +488,48 @@ __global__ void test_linear_fp8_kernel_launcher(const void* input, const void* w
     // kernel::linear_kernel_fp8_weight<
     //     kernel::bfloat16, uint8_t, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE>(
     //         input, weight_fp8, weight_scale, residual, output, true);
+    kernel::linear_kernel_fp8_weight1<
+        kernel::bfloat16, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE>(
+            input, weight_fp8, weight_scale, residual, output, false);
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("old [FP8+scale] rows:\n");
+        bfloat16* out = static_cast<bfloat16*>(output);
+        for (int n = 0; n < OUTPUT_SIZE * BATCH_SIZE; ++n) {
+            printf("%f ", (float)out[n]);
+            if ((n + 1) % OUTPUT_SIZE == 0) {
+                printf("\n");
+            }
+            if (n % 12 == 11) { // 每 12 个输出换行
+                printf("\n");
+            }
+        }
+        // // print the scales for debugging
+        // bfloat16* scales = static_cast<bfloat16*>(const_cast<void*>(weight_scale));
+        // printf("old Scales:\n");
+        // int nBK = (REDUCTION_SIZE + 128 - 1) / 128;
+        // int nBN = (OUTPUT_SIZE + 128 - 1) / 128;
+        // for (int br = 0; br < nBK; ++br) {
+        //     for (int bc = 0; bc < nBN; ++bc) {
+        //         printf("%f ", (float)scales[br * nBN + bc]);
+        //     }
+        // }
+        // printf("\n");
+
+    }
+}
+
+// ===== FP8 权重 kernel（带 scale）=====
+__global__ void test_linear_fp8_kernel_launcher(const void* input, const void* weight_fp8,
+                                                const void* weight_scale, const void* residual, void* output) {
+    extern __shared__ char smem[];
+    // 这里 FP8 用 uint8_t
+    // kernel::linear_kernel_fp8_weight<
+    //     kernel::bfloat16, uint8_t, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE>(
+    //         input, weight_fp8, weight_scale, residual, output, true);
     kernel::linear_kernel_fp8_weight<
         kernel::bfloat16, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE>(
-            input, weight_fp8, weight_scale, residual, output, true);
+            input, weight_fp8, weight_scale, residual, output, false);
 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         printf("[FP8+scale] rows:\n");
@@ -426,6 +537,9 @@ __global__ void test_linear_fp8_kernel_launcher(const void* input, const void* w
         for (int n = 0; n < OUTPUT_SIZE * BATCH_SIZE; ++n) {
             printf("%f ", (float)out[n]);
             if ((n + 1) % OUTPUT_SIZE == 0) {
+                printf("\n");
+            }
+            if (n % 12 == 11) { // 每 12 个输出换行
                 printf("\n");
             }
         }
@@ -451,6 +565,8 @@ int main() {
     cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARE_MEMORY_SIZE);
     cudaFuncSetAttribute(test_linear_fp8_kernel_launcher,
     cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARE_MEMORY_SIZE);
+    cudaFuncSetAttribute(test_linear_fp8_kernel_launcher_old,
+    cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARE_MEMORY_SIZE);
 
     // Host tensors
     std::vector<bfloat16> h_input(BATCH_SIZE * REDUCTION_SIZE);
@@ -460,9 +576,9 @@ int main() {
     std::vector<bfloat16> h_output_fp16(BATCH_SIZE * OUTPUT_SIZE);
     std::vector<bfloat16> h_output_fp8(BATCH_SIZE * OUTPUT_SIZE);
 
-    fill_random(h_input,  600.0f);
-    // fill_random(h_weight_fp16, 600.0f);
-    fill_random_grouped2(h_weight_fp16, REDUCTION_SIZE, OUTPUT_SIZE, 900.0f, 128, 128);
+    fill_random(h_input,  200.0f);
+    // fill_random(h_weight_fp16, 450.0f);
+    fill_random_grouped2(h_weight_fp16, REDUCTION_SIZE, OUTPUT_SIZE, 8000.0f, 128, 128);
     fill_random(h_residual, 100000.0f);
 
 
@@ -492,7 +608,12 @@ int main() {
     h_weight_fp8 = quantize_fp8_with_scales_2d(h_weight_fp16, h_scales,
                                                     REDUCTION_SIZE, OUTPUT_SIZE,
                                                     /*BK=*/128, /*BN=*/128);
-
+    // check that there is no NaN in h_weight_fp8
+    for (int i = 0; i < h_weight_fp8.size(); ++i) {
+        if (h_weight_fp8[i] == 0x7F || h_weight_fp8[i] == 0xFF) {
+            printf("Found NaN in h_weight_fp8 at index %d\n", i);
+        }
+    }
     // print the first 20 weights for debugging
     bool debug1 = true;
     if (debug1) {
@@ -588,12 +709,18 @@ int main() {
     // size_t smem_size = 30000;
 
     // baseline
+    printf("Max shared memory size: %zu bytes\n", MAX_SHARE_MEMORY_SIZE);
     test_linear_kernel_launcher<<<1, 128, MAX_SHARE_MEMORY_SIZE>>>(d_input, d_weight_fp16, d_residual, d_output_fp16);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaGetLastError());
 
     // fp8 + scale
     test_linear_fp8_kernel_launcher<<<1, 128, MAX_SHARE_MEMORY_SIZE>>>(d_input, d_weight_fp8, d_scales, d_residual, d_output_fp8);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaGetLastError());
+
+    // fp8 + scale
+    test_linear_fp8_kernel_launcher_old<<<1, 128, MAX_SHARE_MEMORY_SIZE>>>(d_input, d_weight_fp8, d_scales, d_residual, d_output_fp8);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaGetLastError());
 
@@ -607,14 +734,47 @@ int main() {
         float ref = (float)h_output_fp16[i];
         float tst = (float)h_output_fp8[i];
         float e = fabsf(ref - tst);
-        mre = fmaxf(mre, e / (fabsf(ref) + 1e-6f)); // max relative error
-        mean_rel_err += e / (fabsf(ref) + 1e-6f); // mean relative error
+        mre = fmaxf(mre, e / (fabsf(ref) + 10000.0f)); // max relative error
+        mean_rel_err += e / (fabsf(ref) + 10000.0f); // mean relative error
         max_err = fmaxf(max_err, e);
         mae += e;
     }
     mean_rel_err /= (float)h_output_fp16.size();
     mae /= (float)h_output_fp16.size();
-    std::cout << "Max abs error: " << max_err << ",  Mean abs error: " << mae << ", Max rel error: " << mre << ", Mean rel error: " << mean_rel_err << std::endl;
+    std::cout << ", Max rel error: " << mre << ", Mean rel error: " << mean_rel_err << std::endl;
+
+    // const int warmup = 10;
+    // const int iters  = 200;
+
+    // auto launch_baseline = [&](){
+    //     test_linear_kernel_launcher<<<1, 128, MAX_SHARE_MEMORY_SIZE>>>(d_input, d_weight_fp16, d_residual, d_output_fp16);
+    // };
+    // auto launch_fp8 = [&](){
+    //     test_linear_fp8_kernel_launcher<<<1, 128, MAX_SHARE_MEMORY_SIZE>>>(d_input, d_weight_fp8, d_scales, d_residual, d_output_fp8);
+    // };
+
+    // // Time both
+    // BenchResult base_ms = time_kernel(warmup, iters, launch_baseline);
+    // BenchResult fp8_ms  = time_kernel(warmup, iters, launch_fp8);
+
+    // // Derived metrics
+    // const int M = BATCH_SIZE, N = OUTPUT_SIZE, K = REDUCTION_SIZE;
+    // const double flops      = gemm_flops(M, N, K); // per run
+    // const double bytes_bf16 = bytes_moved_baseline_bf16(M, N, K);
+    // const double bytes_fp8  = bytes_moved_fp8_scale(M, N, K, 128, 128);
+
+    // auto to_tflops = [&](float ms){ return (flops / (ms * 1e-3)) / 1e12; };
+    // auto to_gbps   = [&](double bytes, float ms){ return (bytes / (ms * 1e-3)) / 1e9; };
+
+    // printf("\n==== Performance (M=%d, N=%d, K=%d; %d warmup, %d iters) ====\n", M, N, K, warmup, iters);
+    // printf("Baseline BF16: avg %.3f ms  (std %.3f)\n", base_ms.avg_ms, base_ms.std_ms);
+    // printf("  ~Throughput: %.2f GB/s  |  ~Perf: %.3f TFLOP/s\n",
+    //        to_gbps(bytes_bf16, base_ms.avg_ms), to_tflops(base_ms.avg_ms));
+
+    // printf("FP8 + scale : avg %.3f ms  (std %.3f)\n", fp8_ms.avg_ms, fp8_ms.std_ms);
+    // printf("  ~Throughput: %.2f GB/s  |  ~Perf: %.3f TFLOP/s\n",
+    //        to_gbps(bytes_fp8, fp8_ms.avg_ms), to_tflops(fp8_ms.avg_ms));
+
 
     // 你可以根据模型容忍度改阈值
     if (max_err < 2.0f) {

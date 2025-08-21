@@ -32,6 +32,9 @@ setup(
                 'cxx': [],
                 'nvcc': [
                     '-O3',
+                    "-std=c++20",
+                    "-DJSON_HAS_RANGES=0",
+                    "-lstdc++fs", # Add this flag to adapt to gcc8
                     '-gencode=arch=compute_80,code=sm_80',
                 ]
             }
